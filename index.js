@@ -1,7 +1,7 @@
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const fetch = require('node-fetch');
+const qrcode = require('qrcode');
 
 const app = express();
 app.use(express.json());
@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 
 const sessions = {};
 const qrCodes = {};
-const GAS_URL = process.env.GAS_URL || '';
+const connectionStatus = {};
 
 async function startWhatsAppSession(sessionName) {
     const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionName}`);
@@ -31,74 +31,59 @@ async function startWhatsAppSession(sessionName) {
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        
         if (qr) {
-            qrCodes[sessionName] = qr;
+            // Ubah teks QR mentah dari Baileys menjadi gambar DataURL Base64 agar langsung bisa dibaca tag <img> HTML
+            try {
+                qrCodes[sessionName] = await qrcode.toDataURL(qr);
+                connectionStatus[sessionName] = 'qr_ready';
+            } catch (err) {
+                console.error("Gagal generate QR image:", err);
+            }
         }
+        
         if (connection === 'close') {
+            connectionStatus[sessionName] = 'disconnected';
             const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
             if (shouldReconnect) {
                 startWhatsAppSession(sessionName);
             }
         } else if (connection === 'open') {
-            qrCodes[sessionName] = 'CONNECTED';
-            console.let?.(`Sesi ${sessionName} Berhasil Terhubung!`);
+            connectionStatus[sessionName] = 'connected';
+            qrCodes[sessionName] = null;
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-
-        const sender = msg.key.remoteJid;
-        const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-
-        // Kirim log ke Google Apps Script (GAS)
-        if (GAS_URL) {
-            try {
-                await fetch(GAS_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        action: 'save_message',
-                        sessionName: sessionName,
-                        sender: sender,
-                        message: messageText,
-                        type: 'incoming'
-                    })
-                });
-            } catch (err) {
-                console.error("Gagal kirim ke GAS:", err.message);
-            }
-        }
-    });
 }
 
-// Endpoint Scan / Generate QR
-app.get('/scan', async (req, res) => {
-    const sessionName = req.query.session || 'gils';
+// Endpoint untuk mengambil QR code atau Status Sesi
+app.get('/qr', async (req, res) => {
+    const sessionName = req.query.session || 'gils-session';
+    
+    // Jika sesi belum ada, buat baru
     if (!sessions[sessionName]) {
         startWhatsAppSession(sessionName);
-        // Beri waktu sejenak untuk generate QR pertama kali
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        return res.json({ status: 'loading', message: 'Memulai sesi WhatsApp, silakan refresh sebentar lagi.' });
     }
 
-    const qr = qrCodes[sessionName];
-    if (qr === 'CONNECTED') {
-        return res.json({ status: 'connected', message: 'Sesi sudah terhubung.' });
+    if (connectionStatus[sessionName] === 'connected') {
+        return res.json({ status: 'connected', message: 'Sesi sudah terhubung aktif.' });
     }
-    if (qr) {
-        return res.json({ qr: qr });
+
+    const qrImage = qrCodes[sessionName];
+    if (qrImage) {
+        return res.json({ qr: qrImage });
     }
-    res.json({ status: 'loading', message: 'QR sedang disiapkan, coba refresh sebentar lagi.' });
+
+    res.json({ status: 'loading', message: 'QR sedang disiapkan oleh server...' });
 });
 
 app.get('/', (req, res) => {
     res.send('Gils Blest Multi-Device Railway Gateway is Running Online.');
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`Gateway berjalan di port ${PORT}`);
 });
